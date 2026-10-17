@@ -31,7 +31,7 @@
 #   VLLM_MARLIN_USE_ATOMIC_ADD=1       (+8.8% code, +5.4% mean single-stream)
 #   NOTE: stacking other candidate levers scored WORSE than marlin alone.
 #
-# Measured result: starts, 1,048,576 context, 1,958,130 tokens of KV cache.
+# Measured result: starts, 1,048,576 context, 2,012,851 tokens of KV cache.
 # ============================================================================
 set -eu
 

@@ -13,12 +13,12 @@ by [Arees Manesia](https://github.com/ar33s08)
 
 ---
 
-Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified memory) at the model's full **1,048,576-token context**, with **1,958,130 tokens** of KV cache, speculative decoding, and image input. It runs vLLM (`nightly-aarch64`) with NVIDIA's own NVFP4 checkpoint and the LiLiCorr drafter.
+Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified memory) at the model's full **1,048,576-token context**, with **2,012,851 tokens** of KV cache, speculative decoding, and image input. It runs vLLM (`nightly-aarch64`) with NVIDIA's own NVFP4 checkpoint and the LiLiCorr drafter.
 
 - Checkpoint: [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 - Drafter: `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr`
 - API model id: `nemotron-3.5-super-vl`
-- Context: **1,048,576 tokens** a request, **1,958,130 tokens** of KV cache
+- Context: **1,048,576 tokens** a request, **2,012,851 tokens** of KV cache
 - One command: `config/tuned.sh` starts it
 
 ![shipped config vs this recipe](assets/comparison.png)
@@ -74,7 +74,7 @@ One DGX Spark, clean box, `n=3` median, measured through the OpenAI API.
 |---|---|---|
 | starts | no | **yes** |
 | context served | — | 1,048,576 |
-| KV cache | — | 1,958,130 tok |
+| KV cache | — | 2,012,851 tok |
 
 ## Requirements
 
