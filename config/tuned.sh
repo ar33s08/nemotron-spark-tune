@@ -1,35 +1,38 @@
 #!/usr/bin/env bash
-# TUNED + BOOTABLE config for Nemotron 3.5 Super VL on a single DGX Spark (GB10).
+# Start Nemotron 3.5 Super VL on one DGX Spark (GB10) at full 1M context.
 #
 # ============================================================================
-# THE CRITICAL FIX (why the vendor recipe does not boot)
+# THE FIX
 # ----------------------------------------------------------------------------
-# NVIDIA's published DGX Spark recipe leaves max_model_len at 1M. The vision
-# encoder derives its cache budget from the context length:
+# The shipped config leaves max_model_len at the model's advertised 1M. When
+# video input is enabled the vision encoder sets its cache budget to the ENTIRE
+# context, so it profiles 1,048,576 tokens:
 #
-#   encoder_runner.py:131  -> budget.get_encoder_budget()
-#   encoder_cache_manager.py:354  max(max_num_encoder_input_tokens, max_tokens_per_mm_item)
-#   encoder_budget.py:29  get_mm_max_tokens_per_item(seq_len = model_config.max_model_len)
+#   nano_nemotron_vl.py:361-363
+#       if mm_counts.get("video", 0) > 0:
+#           mm_max_tokens["video"] = seq_len      # seq_len == max_model_len
 #
-# At 1M the encoder tries to profile 1,048,576 tokens. Once the 70 GiB of
-# weights are resident, a 128 MiB allocation fails with ~700 MiB free, the
-# allocator retries in a loop, and the engine dies with
-# "Engine core initialization failed". KV cache is never even allocated.
+# That budget does not fit next to the ~70 GiB of resident weights on a 121 GB
+# box. A 128 MiB allocation fails with ~700 MiB free, the allocator retries, and
+# the engine dies with "Engine core initialization failed". KV cache is never
+# even reached.
 #
-# FIX: --max-model-len 262144  (budget drops 1048576 -> 262144)
+# FIX: --limit-mm-per-prompt '{"video":0,"image":1}'   (keeps all 1M context)
+#      video off routes the encoder through the image-sizing path instead.
+#
+# Need video frames? MAXLEN=262144 VIDEO=1 also starts.
 #
 # Things that DO NOT help (measured, not guessed):
-#   --gpu-memory-utilization  (tried 0.80 / 0.78 / 0.72 / 0.70 - no effect)
-#   --max-num-batched-tokens  (tried 8192 / 4096 / 2048 - budget stayed 1048576)
-# ============================================================================
+#   --gpu-memory-utilization  (0.60/0.70/0.75/0.85/0.90/0.92 - all fail)
+#   --max-num-batched-tokens  (8192/4096/2048 - budget stayed 1048576)
 #
-# Tuning that DOES help, vs the vendor recipe:
-#   --max-num-seqs 1 -> 2              (+214% aggregate throughput @ 4 parallel)
+# Tuning that DOES help:
+#   --max-num-seqs 1 -> 2              (+56% aggregate throughput @ 4 parallel)
 #   VLLM_MARLIN_USE_ATOMIC_ADD=1       (+8.8% code, +5.4% mean single-stream)
-#   NOTE: stacking the other candidate levers scored WORSE than marlin alone.
+#   NOTE: stacking other candidate levers scored WORSE than marlin alone.
 #
-# Measured result: boot ok, 887,377 tokens of KV cache (3.39x concurrency),
-# 53.9 tok/s code, 87.7 tok/s aggregate @ 4 parallel.
+# Measured result: starts, 1,048,576 context, 1,958,130 tokens of KV cache.
+# ============================================================================
 set -eu
 
 MODEL="${MODEL:-/hf/hub/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/snapshots/8a115b9d966adce8c059a7bcf47f49a1e57957d8}"
@@ -97,5 +100,5 @@ docker run -d --name "$NAME" --restart no --ipc host --gpus all \
 echo "launching (max-model-len=$MAXLEN util=$UTIL). ~8-10 min to load."
 echo "watch: docker logs -f $NAME"
 echo
-echo "TRADE-OFF: 262144 context, NOT the advertised 1M. In exchange the box boots"
-echo "           and you get 887,377 tokens of KV cache at 3.39x concurrency."
+echo "context=$MAXLEN  video=$VIDEO  util=$UTIL"
+echo "1M context needs VIDEO=0 (video on caps the encoder budget at the full context)."

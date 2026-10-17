@@ -1,47 +1,31 @@
-# Nemotron 3.5 Super VL on a single DGX Spark (GB10, 121 GB)
+# Nemotron 3.5 Super VL on one DGX Spark
 
-**NVIDIA's published DGX Spark recipe did not boot on my Spark at its advertised
-1M context.** This repo shows what happened, traces it to a specific line in the
-model source, gives the one-flag fix, and reports what it measures like after.
+**Serve NVIDIA's Nemotron 3.5 Super VL (120B-A12B, NVFP4) on a single DGX Spark at its full 1,048,576-token context**, through an OpenAI-compatible API — with a one-flag fix for the encoder budget that otherwise stops it from starting.
 
-Measured on **one** DGX Spark. If yours behaves differently, that is useful — the
-reproduction script is one file.
+by [Arees Manesia](https://github.com/ar33s08)
 
-![benchmark](assets/results.png)
+![Nemotron 3.5 Super VL on one DGX Spark](.github/banner.png)
 
 ---
 
-## TL;DR
+Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified memory) at the model's full **1,048,576-token context**, with **1,958,130 tokens** of KV cache, speculative decoding, and image input. It runs vLLM (`nightly-aarch64`) with NVIDIA's own NVFP4 checkpoint and the LiLiCorr drafter.
 
-```bash
-# On a 121 GB Spark, the published recipe at 1M exits with:
-#   RuntimeError: Engine core initialization failed
-#
-# FIX = disable video (keeps your FULL 1M context):
---limit-mm-per-prompt '{"video":0,"image":1}'
-```
+- Checkpoint: [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
+- Drafter: `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr`
+- API model id: `nemotron-3.5-super-vl`
+- Context: **1,048,576 tokens** a request, **1,958,130 tokens** of KV cache
+- One command: `config/tuned.sh` starts it
 
-**Why:** when video is enabled, the vision encoder sets its cache budget to the
-**entire context length** (`nano_nemotron_vl.py:361-363`). At 1M it profiles
-1,048,576 tokens, and that budget does not fit alongside the ~70 GiB of resident
-weights on a 121 GB box. Disabling video routes the encoder through the
-image-sizing path instead.
+![benchmark](assets/results.png)
 
-**Result:** boots at **full 1,048,576 context**, 1,958,130 tokens of KV cache.
+## The fix
 
-> Need video? Use `--max-model-len 262144` instead. Also boots, 887,377 tokens of
-> KV cache, but you give up 75% of context.
+The shipped config leaves `max_model_len` at the model's advertised 1M. When **video input is enabled**, the vision encoder sets its cache budget to the **entire context**, so it profiles 1,048,576 tokens — which does not fit next to the ~70 GiB of resident weights on a 121 GB box.
 
-## Root cause
-
-The published config leaves `max_model_len` at the model's advertised 1M.
-
-```
-nano_nemotron_vl.py:361-363
-    if mm_counts.get("video", 0) > 0:
-        mm_max_tokens["video"] = seq_len        # seq_len == max_model_len
-encoder_budget.py:29   -> get_mm_max_tokens_per_item(seq_len = max_model_len)
-encoder_runner.py:131  -> "Encoder cache will be initialized with a budget of 1048576 tokens"
+```python
+# nano_nemotron_vl.py:361-363
+if mm_counts.get("video", 0) > 0:
+    mm_max_tokens["video"] = seq_len        # seq_len == max_model_len
 ```
 
 The engine confirms the budget itself, on the way down:
@@ -51,107 +35,93 @@ Encoder cache will be initialized with a budget of 1048576 tokens,
 and profiled with 1 video items of the maximum feature size.
 ```
 
-1,048,576 == `max_model_len`. Once the weights are resident, a 128 MiB allocation
-fails with ~700 MiB free, the allocator retries, the engine dies. It never reaches
-KV cache allocation:
+One flag routes the encoder through the image-sizing path instead, and keeps every token of context:
 
-```
-memory allocation failed with OOM on device 0 while trying to allocate 134217728 bytes
-  (free: 740929536, total: 130663231488)
-RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+```bash
+--limit-mm-per-prompt '{"video":0,"image":1}'
 ```
 
-### Not a tuning problem — every `util` fails
+Need video frames? Use `--max-model-len 262144`. Also starts; you trade 75% of context for video.
 
-Six values of `--gpu-memory-utilization`, video on, 1M, clean box each run:
+## Performance
 
-| util | result |
-|---|---|
-| 0.60 | fail |
-| 0.70 | fail |
-| 0.75 | fail |
-| 0.85 | fail |
-| 0.90 | fail |
-| 0.92 | fail |
+One DGX Spark, clean box, `n=3` median, measured through the OpenAI API.
 
-`0.92` fails *earlier* and differently — before loading:
-`Free memory on device (109.5 GiB) < desired (111.95 GiB)`.
+### This recipe vs the shipped config
 
-The encoder budget is driven purely by `seq_len` while video is on. Only two
-things move it: **lower the context**, or **remove video from the mix**.
-
-### What does NOT fix it (all measured)
-
-| attempt | result |
-|---|---|
-| `--gpu-memory-utilization` sweep (6 values) | **no effect** |
-| `--max-num-batched-tokens` 8192 → 4096 → 2048 | **no effect** (budget stayed 1048576) |
-| `--max-num-batched-tokens 16384` | won't boot: needs 12.82 GiB KV, 6.66 available |
-| `--mm-processor-kwargs '{"num_frames":64}'` | `TypeError` — not a real kwarg |
-| `--mm-processor-kwargs '{"video":...}'` | `TypeError` — flat keys only |
-| `--mm-processor-kwargs '{"max_num_tiles":1,"video_pruning_rate":0.9}'` | still OOMs |
-| restarting / retrying | same failure every time |
-
-### The two working fixes
-
-| goal | flag | result |
-|---|---|---|
-| **full 1M context** | `--limit-mm-per-prompt '{"video":0,"image":1}'` | boots, 1,958,130 tok KV |
-| keep video | `--max-model-len 262144` | boots, 887,377 tok KV |
-
-## Results: vendor recipe vs fixed config
-
-One script run (`scripts/basenum.sh`), n=3 median, clean box each leg.
-
-| metric | vendor recipe @262K\* | ours @262K | **ours @1M** |
+| metric | shipped config @262K\* | this recipe @262K | **this recipe @1M** |
 |---|---|---|---|
 | chat tok/s | **37.7** | 31.6 | 32.0 |
 | code tok/s | 54.3 | **54.9** | 52.8 |
 | single-stream mean | **46.0** | 43.2 | 42.4 |
-| 2 parallel (agg) | 60.1 | **81.3** | **83.7** |
-| **4 parallel (agg)** | 60.2 | **85.4** | **94.1** |
+| 2 parallel, aggregate | 60.1 | **81.3** | **83.7** |
+| 4 parallel, aggregate | 60.2 | **85.4** | **94.1** |
 
-\* The vendor recipe cannot boot at 1M, so 262K is the nearest point where it runs.
+\* The shipped config does not reach 1M, so 262K is the nearest point where it runs.
 
-### Read this honestly
+**Straight read:** the shipped config is ~8% faster single-stream — `seqs=1` does less scheduler work per request. This recipe is **+56% under parallel load**, and is the one that serves 1M at all.
 
-- **The vendor recipe is ~8% FASTER single-stream** (46.0 vs 42.4). `seqs=1` does
-  less scheduler work per request. A real trade, not a win.
-- **Ours is +56% under parallel load** (94.1 vs 60.2) — that is the `seqs 2`
-  change: parallel requests scale instead of serialising.
-- **Ours serves 1M context. Theirs serves nothing at 1M.**
+### Starting up
 
-One request at a time? Their config is genuinely fine, once you cap the context so
-it boots. Fan out, or need 1M? Ours is the only one that runs.
+| | shipped config @1M | this recipe @1M |
+|---|---|---|
+| starts | no | **yes** |
+| context served | — | 1,048,576 |
+| KV cache | — | 1,958,130 tok |
 
-### Stacking the winners made it worse
+## Requirements
 
-| config | mean tok/s |
+- One NVIDIA DGX Spark (GB10, 121 GB unified memory), with nothing else large on the GPU — the loader wants ~112 GiB free.
+- Docker with the NVIDIA container runtime.
+- Both checkpoints pre-downloaded under `HF_HOME`.
+
+## Run
+
+```bash
+./start.sh                  # start on the full 1,048,576 context
+python3 bench/bench.py      # measure it
+./stop.sh                   # stop and free memory
+```
+
+`VIDEO=1 ./start.sh` keeps video input (and drops to 262,144 context).
+
+Or reproduce the whole comparison:
+
+```bash
+bash verify.sh              # both configs, paired, records both outcomes
+bash scripts/basenum.sh     # the three measured legs behind the table
+bash scripts/edge.sh        # the six-value gpu-memory-utilization sweep
+```
+
+## What was tried, and what did not work
+
+Every row measured. This box varies ±1.5% run to run; anything inside that is called flat.
+
+| attempt | result |
 |---|---|
-| `VLLM_MARLIN_USE_ATOMIC_ADD` alone | **45.0** |
-| both best levers | 43.1–43.8 |
-| stock | 42.7 |
+| `--gpu-memory-utilization` 0.60 / 0.70 / 0.75 / 0.85 / 0.90 / 0.92 | all fail at 1M with video on |
+| `--max-num-batched-tokens` 8192 → 4096 → 2048 | no effect (budget stayed 1048576) |
+| `--max-num-batched-tokens 16384` | will not start: needs 12.82 GiB KV, 6.66 available |
+| `--mm-processor-kwargs '{"num_frames":64}'` | `TypeError` — not a real kwarg |
+| `--mm-processor-kwargs '{"video":...}'` | `TypeError` — flat keys only |
+| `--mm-processor-kwargs '{"max_num_tiles":1,"video_pruning_rate":0.9}'` | still OOMs |
+| `--async-scheduling` with a 16384 batch | **−27%** |
+| `--kv-cache-dtype fp8` | flat — `fp8_e4m3` is already the default |
+| drafter `candidate_topk` 8 → 16 | `AssertionError` — the checkpoint's `rank_embedding` is baked at 8 |
+| `VLLM_BATCH_INVARIANT=1` | will not start |
+| `mamba-ssm-cache-dtype float32` with stochastic rounding | mutually exclusive |
 
-Individually-good flags collide. Ship one, not a pile. `MARLIN_USE_ATOMIC_ADD`
-matters because GB10 has no native FP4, so every GEMM routes through Marlin.
+**Stacking the winners made it worse.** `VLLM_MARLIN_USE_ATOMIC_ADD` alone measures **45.0** tok/s; adding a second winning flag drops it to 43.1. Ship one, not a pile. That env var matters because GB10 has no native FP4, so every GEMM routes through Marlin.
 
-## Two related landmines
+### Two things found on the way
 
-1. **Swap spill.** Stock `min_free_kbytes` is ~44 MB and `swappiness` is 60, so the
-   kernel pages the model out instead of keeping it resident. Proof: swap went
-   **9989 MB → 129 MB** across a teardown. `config/tuned.sh` dirties and frees an
-   8 GB buffer before launching to force reclamation (no root needed).
+**Swap spill.** Stock `min_free_kbytes` is ~44 MB and `swappiness` is 60, so the kernel pages the model out rather than keeping it resident — swap reached 9989 MB during one load and fell to 129 MB after teardown. `config/tuned.sh` dirties and frees an 8 GB buffer before launching to force reclamation, with no root needed.
 
-2. **`--gpu-memory-utilization` is a SYSTEM setting on unified memory.** It is a
-   slice of the whole 121 GB shared with the OS, not dedicated VRAM. At 0.85 it
-   pinned ~108 GB unswappable and wedged the box: `ping` works, TCP to :22 still
-   *accepts*, but `sshd` never sends its banner because it cannot fork. Recovery
-   needs a physical power button.
+**`gpu_memory_utilization` is a system setting on unified memory** — a slice of the whole 121 GB rather than dedicated VRAM. At 0.85 it pinned ~108 GB unswappable and wedged the box: `ping` worked and TCP to :22 still accepted, but `sshd` could not fork, so it never sent its banner. Recovery needs the power button.
 
 ## Full variant table (18 variants, 3 phases)
 
-`base` = vendor recipe at that phase's settings. Run-to-run variance on this box is
-**±1.5%** — anything inside that is called flat.
+Run-to-run variance on this box is **±1.5%** — anything inside that is called flat.
 
 ### Phase 1 — scheduling (baseline: mean 38.6 / conc4 27.3)
 
@@ -184,53 +154,30 @@ matters because GB10 has no native FP4, so every GEMM routes through Marlin.
 | combo_all (4 levers) | 43.8 | worse |
 | combo_safe (2 levers) | 43.1 | worse |
 
-## Other failures, with verbatim errors
-
-| attempt | error |
-|---|---|
-| drafter `candidate_topk` 8 → 16 | `AssertionError: Attempted to load weight (torch.Size([1,1,1,8,1024])) into parameter (torch.Size([1,1,1,16,1024]))` — vLLM source allows ≤16; the checkpoint's `rank_embedding` is baked at 8 |
-| `VLLM_BATCH_INVARIANT=1` | won't boot |
-| `mamba-ssm-cache-dtype float32` + stochastic rounding | mutually exclusive: `Stochastic rounding for Mamba cache requires the SSM cache to be float16` |
-
 ## Other findings
 
-- LiLiCorr spec depth is already maxed at 7 (its `block_size` is 8).
-- FlashInfer's autotuner only completes a full pass on an idle box; under contention
-  it silently fell back to `tactic=-1`. The "no tuned config" warnings were a
-  symptom of contention, not a broken kernel.
+- LiLiCorr's speculative depth is already maxed at 7 (its `block_size` is 8).
+- FlashInfer's autotuner only completes a full pass on an idle box; under contention it silently fell back to `tactic=-1`. The "no tuned config" warnings were a symptom of contention, not a broken kernel.
 - `--kv-cache-dtype fp8` is a no-op: `fp8_e4m3` is already the default.
-
-## Reproduce
-
-```bash
-bash verify.sh                    # both legs, paired A/B, records the failure
-bash scripts/basenum.sh           # the three measured legs behind the table
-bash scripts/edge.sh              # the 6-value util sweep
-bash config/tuned.sh              # just the working config
-python3 bench/bench.py --label tuned
-```
-
-Requires: docker, a DGX Spark, and the NVFP4 weights + LiLiCorr drafter
-pre-downloaded under `HF_HOME`.
-
-## Layout
-
-```
-verify.sh            # paired A/B: vendor vs fixed, back to back
-config/baseline.sh   # NVIDIA's published DGX Spark recipe
-config/tuned.sh      # the fix (video=0) + tuning flags
-bench/bench.py       # single-stream + concurrency benchmark (n=3 median)
-scripts/             # the individual experiments, kept for the record
-```
 
 ## Honest limitations
 
 - One machine, one model, one serving stack. A different Spark may differ.
-- Video-off is a **behaviour change**, not a free win: no video understanding at 1M.
-  The 262K+video config exists for that.
+- Turning video off is a **behaviour change**, not a free win: you keep the full 1M context but lose video understanding. `--max-model-len 262144` keeps video.
 - ±1.5% run-to-run variance; effects below that are labelled flat.
-- Phase tables ran under different box-idle conditions, so they are grouped rather
-  than mixed into one headline number.
+- The phase tables ran under different box-idle conditions, so they are grouped rather than mixed into one headline number.
+
+## Layout
+
+```
+start.sh             # start it (full 1M context)
+stop.sh              # stop it and free memory
+config/tuned.sh      # the fix (video=0) plus tuning flags
+config/baseline.sh   # the shipped DGX Spark config, for comparison
+verify.sh            # paired A/B, records both outcomes
+bench/bench.py       # single-stream + concurrency benchmark (n=3 median)
+scripts/             # the individual experiments, kept for the record
+```
 
 ## License
 
@@ -238,4 +185,4 @@ Apache-2.0
 
 ---
 
-Model: [nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4) (OpenMDW-1.1)
+Model: [nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
