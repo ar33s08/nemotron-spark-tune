@@ -21,7 +21,9 @@ Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified 
 - Context: **1,048,576 tokens** a request, **1,958,130 tokens** of KV cache
 - One command: `config/tuned.sh` starts it
 
-![benchmark](assets/results.png)
+![shipped config vs this recipe](assets/comparison.png)
+
+![startup and throughput table](assets/results.png)
 
 ## The fix
 
