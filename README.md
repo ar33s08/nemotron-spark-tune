@@ -105,6 +105,8 @@ Only two things move it: lower the context, or remove video from the mix.
 
 Full 1M comes at the cost of video. Both are ~equal on throughput.
 
+![benchmark](assets/results.png)
+
 ## Results: vendor recipe vs ours (all legs, same box, back to back)
 
 All rows from one script run (`scripts/basenum.sh`), n=3 median, clean box each leg.
