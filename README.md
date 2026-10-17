@@ -6,6 +6,11 @@ by [Arees Manesia](https://github.com/ar33s08)
 
 ![Nemotron 3.5 Super VL on one DGX Spark](.github/banner.png)
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Hardware](https://img.shields.io/badge/hardware-1%C3%97%20DGX%20Spark%20GB10-76b900.svg)](#requirements)
+[![Context](https://img.shields.io/badge/context-1%2C048%2C576%20tokens-76b900.svg)](#performance)
+[![Server](https://img.shields.io/badge/served%20with-vLLM%20%C2%B7%20NVFP4-1f6feb.svg)](https://github.com/vllm-project/vllm)
+
 ---
 
 Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified memory) at the model's full **1,048,576-token context**, with **1,958,130 tokens** of KV cache, speculative decoding, and image input. It runs vLLM (`nightly-aarch64`) with NVIDIA's own NVFP4 checkpoint and the LiLiCorr drafter.
