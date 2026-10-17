@@ -105,17 +105,30 @@ Only two things move it: lower the context, or remove video from the mix.
 
 Full 1M comes at the cost of video. Both are ~equal on throughput.
 
-## Tuning (once it boots)
+## Results: vendor recipe vs tuned (paired, same box, back-to-back)
 
-Two changes vs the vendor recipe:
+Both legs run in one script (`verify.sh`) on a clean box, same context target.
 
-| flag | vendor | tuned | measured |
-|---|---|---|---|
-| `--max-num-seqs` | 1 | **2** | **+214% aggregate @ 4 parallel** |
-| `VLLM_MARLIN_USE_ATOMIC_ADD` | unset | **1** | **+8.8% code, +5.4% mean** |
+| metric | vendor recipe | **tuned** |
+|---|---|---|
+| **boots?** | **❌ `Exited (1)`** | ✅ **BOOT OK** |
+| context served | never reached | **1,048,576** |
+| KV cache | never reached | **1,958,130 tokens** |
+| code generation | — | **53.1 tok/s** |
+| 4 parallel (aggregate) | — | **90.4 tok/s** |
+| single-stream mean | — | 41.2 tok/s |
 
-> The `+214%` is a *concurrency* effect — `seqs=1` serialises parallel requests.
-> Single-stream the honest number is +5.4% / +8.8%.
+Baseline failure, verbatim:
+
+```
+memory allocation failed with OOM on device 0 while trying to allocate 201326592 bytes
+  (free: 648052736, total: 130663231488)
+memory allocation failed with OOM on device 0 while trying to allocate 335544320 bytes
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+```
+
+> The vendor recipe does not degrade — it OOMs during load and exits. There is no
+> throughput number to report for it at 1M context because it never serves.
 
 `VLLM_MARLIN_USE_ATOMIC_ADD` matters because GB10 has no native FP4, so every GEMM
 routes through the Marlin kernel. Marlin/compile-layer knobs move throughput;
@@ -187,8 +200,8 @@ Run-to-run variance on this box is **±1.5%** — anything inside that is called
 ## Reproduce
 
 ```bash
-bash config/baseline.sh   # vendor recipe (expected: fails to boot)
-bash config/tuned.sh      # fixed + tuned (expected: boots in ~13 min)
+bash verify.sh            # runs BOTH legs and records the paired result
+bash config/tuned.sh      # just the working config
 python3 bench/bench.py --label tuned
 ```
 
@@ -198,8 +211,9 @@ pre-downloaded under `HF_HOME`.
 ## Layout
 
 ```
+verify.sh            # paired A/B: baseline vs tuned, same box, back to back
 config/baseline.sh   # NVIDIA's published DGX Spark recipe
-config/tuned.sh      # the boot fix + the two tuning flags
+config/tuned.sh      # the boot fix (video=0) + tuning flags
 bench/bench.py       # single-stream + concurrency benchmark (n=3 median)
 ```
 
