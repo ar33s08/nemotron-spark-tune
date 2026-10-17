@@ -215,6 +215,7 @@ verify.sh            # paired A/B: baseline vs tuned, same box, back to back
 config/baseline.sh   # NVIDIA's published DGX Spark recipe
 config/tuned.sh      # the boot fix (video=0) + tuning flags
 bench/bench.py       # single-stream + concurrency benchmark (n=3 median)
+scripts/             # experiment scripts kept for the record
 ```
 
 ## Honest limitations
