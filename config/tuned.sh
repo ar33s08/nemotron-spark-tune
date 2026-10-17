@@ -36,8 +36,10 @@ MODEL="${MODEL:-/hf/hub/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-N
 DRAFTER="${DRAFTER:-/hf/hub/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr/snapshots/7c7221aeb4cb3139307aa457f7dce11a8fb6ceb2}"
 NAME="${NAME:-supervl}"
 PORT="${PORT:-18300}"
-MAXLEN="${MAXLEN:-262144}"
-UTIL="${UTIL:-0.88}"
+MAXLEN="${MAXLEN:-1048576}"
+UTIL="${UTIL:-0.85}"
+# Video OFF = full 1M context. Set VIDEO=1 (and MAXLEN=262144) if you need frames.
+VIDEO="${VIDEO:-0}"
 
 # --- step 1: reclaim memory BEFORE launching ---------------------------------
 # min_free_kbytes is ~44MB on a stock Spark and swappiness is 60, so the kernel
@@ -85,7 +87,7 @@ docker run -d --name "$NAME" --restart no --ipc host --gpus all \
   --mamba-cache-philox-rounds 5 \
   --enable-mamba-shared-prefix-checkpoint \
   --video-pruning-rate 0.7 \
-  --limit-mm-per-prompt '{"video":1,"image":1}' \
+  --limit-mm-per-prompt "{\"video\":$VIDEO,\"image\":1}" \
   --block-size 64 \
   --prefix-match-unit 64 \
   --enable-auto-tool-choice \

@@ -12,22 +12,34 @@ Measured on **one** NVIDIA DGX Spark (GB10, 121 GB unified memory).
 
 ```bash
 # vendor recipe fails with: "Engine core initialization failed"
-# fix = ONE flag:
---max-model-len 262144
+#
+# FIX = disable video, which keeps your FULL 1M context:
+--limit-mm-per-prompt '{"video":0,"image":1}'
 ```
 
-Then it boots: 887,377 tokens of KV cache, 3.39x concurrency, 53.9 tok/s code,
-87.7 tok/s aggregate at 4 parallel.
+Root cause: the processor hardcodes the encoder cache budget to the **entire
+context length whenever video is enabled** (`nano_nemotron_vl.py:361-363`). So the
+encoder tries to profile 1M tokens and OOMs once the 70 GiB of weights are resident.
+Turning video off routes the encoder through the image-sizing path instead.
+
+Result: boots at **full 1,048,576 context**, 1,958,130 tokens of KV cache,
+1.87x concurrency, 51.8 tok/s code.
+
+> Alternative if you need video: keep `--max-model-len 262144`. That also boots,
+> with 887,377 tokens of KV cache at 3.39x concurrency, but you lose 75% of context.
 
 ## The bug
 
 NVIDIA's DGX Spark config leaves `max_model_len` at the model's advertised 1M.
-The **vision encoder derives its cache budget from the context length**:
+The **encoder hardcodes its cache budget to the whole context whenever video is
+enabled**:
 
 ```
-encoder_runner.py:131           -> budget.get_encoder_budget()
-encoder_cache_manager.py:354    max(max_num_encoder_input_tokens, max_tokens_per_mm_item)
-encoder_budget.py:29            get_mm_max_tokens_per_item(seq_len = model_config.max_model_len)
+nano_nemotron_vl.py:361-363
+    if mm_counts.get("video", 0) > 0:
+        mm_max_tokens["video"] = seq_len        # seq_len == max_model_len
+encoder_budget.py:29   -> get_mm_max_tokens_per_item(seq_len = max_model_len)
+encoder_runner.py:131  -> "Encoder cache will be initialized with a budget of 1048576 tokens"
 ```
 
 At 1M the encoder tries to profile **1,048,576 tokens**. Once the 70 GiB of
@@ -43,17 +55,31 @@ RuntimeError: Engine core initialization failed. See root cause above.
 
 It never even reaches KV cache allocation.
 
+### The two fixes (both verified)
+
+| goal | flag | result |
+|---|---|---|
+| **full 1M context** | `--limit-mm-per-prompt '{"video":0,"image":1}'` | boots, 1,958,130 tok KV, 1.87x conc |
+| keep video | `--max-model-len 262144` | boots, 887,377 tok KV, 3.39x conc |
+
+Disabling video makes `mm_counts["video"] == 0` so the encoder sizes from images
+instead of the full context. You lose video understanding but keep every token of
+context the model advertises.
+
 ### What does NOT fix it (all measured)
 
 | attempt | result |
 |---|---|
 | `--gpu-memory-utilization` 0.80 → 0.78 → 0.72 → 0.70 | **no effect** |
+| `--gpu-memory-utilization` 0.92 with 1M | fails *earlier*: `Free memory (109.5 GiB) < desired (111.95 GiB)` |
 | `--max-num-batched-tokens` 8192 → 4096 → 2048 | **no effect** (budget stayed 1048576) |
 | `--mm-processor-kwargs '{"num_frames":64}'` | `TypeError` — not a real kwarg |
 | `--mm-processor-kwargs '{"video":...}'` | `TypeError` — processor takes flat keys only |
+| `--mm-processor-kwargs '{"max_num_tiles":1,"video_pruning_rate":0.9}'` at 1M | still OOMs |
 | restarting / retrying | same failure every time |
 
-The encoder budget is driven purely by `max_model_len`. Nothing else moves it.
+The encoder budget is driven purely by `seq_len` (context) **while video is on**.
+Only two things move it: lower the context, or remove video from the mix.
 
 ### Two related landmines found on the way
 
@@ -70,9 +96,14 @@ The encoder budget is driven purely by `max_model_len`. Nothing else moves it.
 
 ## The trade-off, stated honestly
 
-You get **262,144 context, not the advertised 1,000,000.** In exchange the box
-boots, and you get 887,377 tokens of KV cache at **3.39x concurrency** — which is
-what an agent workload actually uses.
+**Two working configurations. Pick by what you need:**
+
+| config | context | KV cache | when to use |
+|---|---|---|---|
+| video disabled | **1,048,576** (full) | 1,958,130 tok | long-context text + images |
+| video enabled | 262,144 | 887,377 tok | you need video frames |
+
+Full 1M comes at the cost of video. Both are ~equal on throughput.
 
 ## Tuning (once it boots)
 
