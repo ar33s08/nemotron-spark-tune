@@ -105,30 +105,42 @@ Only two things move it: lower the context, or remove video from the mix.
 
 Full 1M comes at the cost of video. Both are ~equal on throughput.
 
-## Results: vendor recipe vs tuned (paired, same box, back-to-back)
+## Results: vendor recipe vs ours (all legs, same box, back to back)
 
-Both legs run in one script (`verify.sh`) on a clean box, same context target.
+All rows from one script run (`scripts/basenum.sh`), n=3 median, clean box each leg.
 
-| metric | vendor recipe | **tuned** |
-|---|---|---|
-| **boots?** | **❌ `Exited (1)`** | ✅ **BOOT OK** |
-| context served | never reached | **1,048,576** |
-| KV cache | never reached | **1,958,130 tokens** |
-| code generation | — | **53.1 tok/s** |
-| 4 parallel (aggregate) | — | **90.4 tok/s** |
-| single-stream mean | — | 41.2 tok/s |
+| metric | vendor recipe @262K\* | ours @262K | **ours @1M** |
+|---|---|---|---|
+| chat tok/s | **37.7** | 31.6 | 32.0 |
+| code tok/s | 54.3 | **54.9** | 52.8 |
+| single-stream mean | **46.0** | 43.2 | 42.4 |
+| 2 parallel (agg) | 60.1 | **81.3** | **83.7** |
+| **4 parallel (agg)** | 60.2 | **85.4** | **94.1** |
 
-Baseline failure, verbatim:
+\* The vendor recipe cannot boot at its own advertised 1M context, so 262K is the
+nearest point of comparison where it runs at all.
+
+### Read this honestly
+
+- **The vendor recipe is ~8% FASTER single-stream** (46.0 vs 42.4 mean). `seqs=1`
+  means less scheduler work per request. That is a real trade, not a win for us.
+- **Ours is +56% faster under parallel load** (94.1 vs 60.2). That is the `seqs 2`
+  change: parallel requests scale instead of serialising.
+- **Ours serves 1M context; theirs serves nothing at 1M.**
+
+If your workload is one request at a time, the vendor recipe is genuinely fine —
+once you cap its context so it boots. If you fan out, or you need the advertised
+1M context, ours is the only one that works.
+
+### Does the vendor recipe boot at 1M?
+
+No. Three attempts at `--gpu-memory-utilization` 0.88 / 0.90 / 0.92 all failed:
 
 ```
 memory allocation failed with OOM on device 0 while trying to allocate 201326592 bytes
   (free: 648052736, total: 130663231488)
-memory allocation failed with OOM on device 0 while trying to allocate 335544320 bytes
 RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
 ```
-
-> The vendor recipe does not degrade — it OOMs during load and exits. There is no
-> throughput number to report for it at 1M context because it never serves.
 
 `VLLM_MARLIN_USE_ATOMIC_ADD` matters because GB10 has no native FP4, so every GEMM
 routes through the Marlin kernel. Marlin/compile-layer knobs move throughput;
