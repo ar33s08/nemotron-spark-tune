@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# decisive.sh — ONE clean paired A/B. No interruptions.
+#   leg 1: NVIDIA baseline recipe  -> bench
+#   leg 2: tuned config            -> bench
+# Retries a leg once if it OOMs (baseline is known to be fragile at util 0.75).
+# Leaves the TUNED config running at the end.
+set -u
+W=~/decisive; mkdir -p "$W"; rm -f "$W"/res-*.json
+LOG="$W/d.log"
+MODEL=/hf/hub/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4/snapshots/8a115b9d966adce8c059a7bcf47f49a1e57957d8
+DRAFTER=/hf/hub/models--nvidia--NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr/snapshots/7c7221aeb4cb3139307aa457f7dce11a8fb6ceb2
+log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG"; }
+
+clean(){ docker rm -f supervl >/dev/null 2>&1; sync; sleep 15;
+         # wait for memory to actually come back
+         for i in $(seq 1 30); do
+           av=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+           [ "$av" -ge 100 ] && break; sleep 10
+         done; log "mem available: ${av}GB"; }
+
+launch(){ # $1 = base|tuned
+  clean
+  if [ "$1" = "base" ]; then
+    EXTRA=""; SEQS=1; UTIL=0.75; MAMBA=float16; STOCH="--enable-mamba-cache-stochastic-rounding"; VID=""
+  else
+    EXTRA="-e VLLM_MARLIN_USE_ATOMIC_ADD=1"; SEQS=2; UTIL=0.80; MAMBA=float32; STOCH=""; VID="--video-pruning-rate 0.5"
+  fi
+  # shellcheck disable=SC2086
+  docker run -d --name supervl --restart no --ipc host --gpus all \
+    -e HF_HOME=/hf -e HF_HUB_OFFLINE=1 -e OMP_NUM_THREADS=20 $EXTRA \
+    -v /home/areesm/.cache/huggingface:/hf -p 127.0.0.1:18300:8000 \
+    vllm/vllm-openai:nightly-aarch64 \
+<｜begin▁of▁sentence｜>def 2>/dev/null
+}
