@@ -107,6 +107,51 @@ Full 1M comes at the cost of video. Both are ~equal on throughput.
 
 ![benchmark](assets/results.png)
 
+## Why it fails: the encoder budget
+
+Verbatim from the shipped model file, `nano_nemotron_vl.py`:
+
+```python
+if mm_counts.get("video", 0) > 0:
+    assert self.supports_video
+    mm_max_tokens["video"] = seq_len          # seq_len == max_model_len
+```
+
+When video is enabled the vision encoder's cache budget is set to the **entire
+context**. The engine says so on the way down:
+
+```
+Encoder cache will be initialized with a budget of 1048576 tokens,
+and profiled with 1 video items of the maximum feature size.
+```
+
+1,048,576 == `max_model_len`. At 1M that budget must coexist with ~70GB of
+weights, and on a 121GB unified-memory Spark it does not fit.
+
+### It is not a tuning problem — every util fails
+
+Six values of `--gpu-memory-utilization`, video on, 1M context, clean box each run:
+
+| util | result |
+|---|---|
+| 0.60 | fail |
+| 0.70 | fail |
+| 0.75 | fail |
+| 0.85 | fail |
+| 0.90 | fail |
+| 0.92 | fail |
+
+All six end the same way:
+
+```
+memory allocation failed with OOM on device 0 while trying to allocate 134217728 bytes
+  (free: 707936256, total: 130663231488)
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+```
+
+So the fix is the modality, not the memory knob: turn video off and the encoder
+uses the image sizing path instead of `seq_len`.
+
 ## Results: vendor recipe vs ours (all legs, same box, back to back)
 
 All rows from one script run (`scripts/basenum.sh`), n=3 median, clean box each leg.
