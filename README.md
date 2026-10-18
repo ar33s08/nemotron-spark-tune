@@ -13,12 +13,12 @@ by [Arees Manesia](https://github.com/ar33s08)
 
 ---
 
-Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified memory) at the model's full **1,048,576-token context**, with **2,012,851 tokens** of KV cache, speculative decoding, and image input. It runs vLLM (`nightly-aarch64`) with NVIDIA's own NVFP4 checkpoint and the LiLiCorr drafter.
+Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified memory) with **video and image input** at a **524,288-token context**, or **1,048,576** with video off — with speculative decoding, 596,634-2,012,851 tokens of KV cache, and a one-flag fix for the encoder budget that otherwise stops it starting. It runs vLLM (`nightly-aarch64`) with NVIDIA's own NVFP4 checkpoint and the LiLiCorr drafter.
 
 - Checkpoint: [`nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4)
 - Drafter: `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4-LiLiCorr`
 - API model id: `nemotron-3.5-super-vl`
-- Context: **1,048,576 tokens** a request, **2,012,851 tokens** of KV cache
+- Context: **524,288** with video (default) or **1,048,576** video-off; up to 2,012,851 tokens of KV cache
 - One command: `config/tuned.sh` starts it
 
 ![shipped config vs this recipe](assets/comparison.png)
@@ -27,7 +27,18 @@ Serve **Nemotron 3.5 Super VL** from one NVIDIA DGX Spark (GB10, 121 GB unified 
 
 ## The fix
 
-The shipped config leaves `max_model_len` at the model's advertised 1M. When **video input is enabled**, the vision encoder sets its cache budget to the **entire context**, so it profiles 1,048,576 tokens — which does not fit next to the ~70 GiB of resident weights on a 121 GB box.
+The shipped config leaves `max_model_len` at the model's advertised 1M. When **video input is enabled**, the vision encoder sets its cache budget to the **entire context** (`encoder_budget.py:29` passes `seq_len=max_model_len`), so at 1M it tries to profile 1,048,576 tokens.
+
+Two walls follow, and they are the same root cause seen from two sides:
+
+| context (video on) | what happens |
+|---|---|
+| 1,048,576 | encoder OOM during profile — engine exits, no KV cache allocated |
+| 786,432 | encoder profiling dies partway |
+| 524,288 | fits |
+| 393,216 @ `util 0.80` | **KV starves** — `needs 11.47 GiB KV, only 4.68 available` |
+
+That last row is the useful one: the encoder cache takes its memory *before* KV cache allocates, so a low `--gpu-memory-utilization` leaves KV with almost nothing and the engine exits.
 
 ```python
 # nano_nemotron_vl.py:361-363
@@ -42,13 +53,14 @@ Encoder cache will be initialized with a budget of 1048576 tokens,
 and profiled with 1 video items of the maximum feature size.
 ```
 
-One flag routes the encoder through the image-sizing path instead, and keeps every token of context:
+Two working configurations follow from that — pick by whether you need video:
 
 ```bash
---limit-mm-per-prompt '{"video":0,"image":1}'
+# keep video, lower the context, and raise util so KV survives:
+--max-model-len 524288 --gpu-memory-utilization 0.90
+# or drop video and keep the full 1M:
+--max-model-len 1048576 --limit-mm-per-prompt '{"video":0,"image":1}'
 ```
-
-Need video frames? Use `--max-model-len 262144`. Also starts; you trade 75% of context for video.
 
 ## Performance
 
@@ -56,25 +68,28 @@ One DGX Spark, clean box, `n=3` median, measured through the OpenAI API.
 
 ### This recipe vs the shipped config
 
-| metric | shipped config @262K\* | this recipe @262K | **this recipe @1M** |
+| metric | shipped config @262K\* | video OFF, 1M | **video ON, 524K (default)** |
 |---|---|---|---|
-| chat tok/s | **37.7** | 31.6 | 32.0 |
-| code tok/s | 54.3 | **54.9** | 52.8 |
-| single-stream mean | **46.0** | 43.2 | 42.4 |
-| 2 parallel, aggregate | 60.1 | **81.3** | **83.7** |
-| 4 parallel, aggregate | 60.2 | **85.4** | **94.1** |
+| chat tok/s | **37.7** | 31.4 | 32.6 |
+| code tok/s | 54.3 | 51.0 | **51.7** |
+| single-stream mean | **46.0** | 41.2 | **42.2** |
+| 2 parallel, aggregate | 60.1 | 83.7 | 85.0 |
+| 4 parallel, aggregate | 60.2 | 85.1 | **86.3** |
+
+**Video costs almost nothing.** Serving video at 524,288 measures *faster* than dropping video to reach 1,048,576 (mean 42.2 vs 41.2, conc4 86.3 vs 85.1), so `./start.sh` defaults to video on.
 
 \* The shipped config does not reach 1M, so 262K is the nearest point where it runs.
 
-**Straight read:** the shipped config is ~8% faster single-stream — `seqs=1` does less scheduler work per request. This recipe is **+56% under parallel load**, and is the one that serves 1M at all.
+**Straight read:** the shipped config is ~8% faster single-stream — `seqs=1` does less scheduler work per request. This recipe is **+56% under parallel load**, and is the one that serves the advertised context at all.
 
 ### Starting up
 
-| | shipped config @1M | this recipe @1M |
-|---|---|---|
-| starts | no | **yes** |
-| context served | — | 1,048,576 |
-| KV cache | — | 2,012,851 tok |
+| | shipped config @1M | video off @1M | video on @524K |
+|---|---|---|---|
+| starts | no | **yes** | **yes** |
+| context served | — | 1,048,576 | 524,288 |
+| KV cache | — | 2,012,851 tok | 596,634 tok |
+| video | (can't reach) | no | **yes** |
 
 ## Requirements
 
@@ -106,7 +121,9 @@ Every row measured. This box varies ±1.5% run to run; anything inside that is c
 
 | attempt | result |
 |---|---|
-| `--gpu-memory-utilization` 0.60 / 0.70 / 0.75 / 0.85 / 0.90 / 0.92 | all fail at 1M with video on |
+| `--gpu-memory-utilization` 0.60-0.92 **at 1M** with video on | all fail (encoder OOM) |
+| `--gpu-memory-utilization` 0.80 **at 393K** with video on | **fails: KV starves, only 4.68 GiB available** |
+| `--gpu-memory-utilization` 0.88 / 0.90 at 393K | **works** — 513,228 / 595,824 tok KV |
 | `--max-num-batched-tokens` 8192 → 4096 → 2048 | no effect (budget stayed 1048576) |
 | `--max-num-batched-tokens 16384` | will not start: needs 12.82 GiB KV, 6.66 available |
 | `--mm-processor-kwargs '{"num_frames":64}'` | `TypeError` — not a real kwarg |
